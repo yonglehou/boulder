@@ -7,59 +7,60 @@ package main
 
 import (
 	"fmt"
-	"net/http"
 
 	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cactus/go-statsd-client/statsd"
 	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/streadway/amqp"
 	"time"
 
+	// Load both drivers to allow configuring either
+	_ "github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/go-sql-driver/mysql"
+	_ "github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/mattn/go-sqlite3"
+
+	"database/sql"
 	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/rpc"
-	"github.com/letsencrypt/boulder/wfe"
+	"github.com/letsencrypt/boulder/sa"
 
 	gorp "github.com/letsencrypt/boulder/Godeps/_workspace/src/gopkg.in/gorp.v1"
 )
 
-func setupClients(c cmd.Config) (cac rpc.CertificateAuthorityClient, dbMap gorp.DbMap, chan *amqp.Error) {
+func setupClients(c cmd.Config) (rpc.CertificateAuthorityClient, chan *amqp.Error) {
 	ch := cmd.AmqpChannel(c.AMQP.Server)
 	closeChan := ch.NotifyClose(make(chan *amqp.Error, 1))
 
 	cac, err := rpc.NewCertificateAuthorityClient(c.AMQP.CA.Client, c.AMQP.CA.Server, ch)
 	cmd.FailOnError(err, "Unable to create CA client")
 
-	db, err := sql.Open("sqlite3", ":memory:")
-	dbmap := &gorp.DbMap{
-		Db: db,
-		Dialect: gorp.SqliteDialect{},
-		//Dialect: gorp.MySQLDialect{Engine: "InnoDB", Encoding: "UTF8"},
-		TypeConverter: core.BoulderTypeConverter{}
-	}
-	return cac, dbMap, closeChan
+	return cac, closeChan
 }
 
-func updateOne(dbMap gorp.DbMap) {
-	tx, err := ssa.dbMap.Begin()
+func updateOne(dbMap *gorp.DbMap, oldestLastUpdatedTime time.Time) {
+	log := blog.GetAuditLogger()
+
+	tx, err := dbMap.Begin()
 	if err != nil {
 		tx.Rollback()
-		return err
+		return
 	}
 
 	// If there are fewer than this many days left before the currently-signed
 	// OCSP response expires, sign a new OCSP response.
-	minDaysToExpiry := 3
 	var certificateStatus []core.CertificateStatus
-	result, err = tx.Select(&certificateStatus,
+	result, err := tx.Select(&certificateStatus,
 		`SELECT * FROM certificateStatus
 		 WHERE ocspLastUpdated > ?
 		 ORDER BY ocspLastUpdated ASC
-		 LIMIT 1`, time.Now().Add(-minDaysToExpiry * 24 * time.Hour))
+		 LIMIT 1`, oldestLastUpdatedTime)
+
 	if err == sql.ErrNoRows {
+		log.Info("No OCSP responses needed.")
 		return
 	} else if err != nil {
-		blog.GetAuditLogger().Error("Error getting certificate status: " + err.Error())
+		log.Err("Error loading certificate status: " + err.Error())
 	} else {
-		fmt.Println(result)
+		log.Info(fmt.Sprintf("%+v\n", result))
 	}
 }
 
@@ -73,9 +74,19 @@ func main() {
 		auditlogger, err := blog.Dial(c.Syslog.Network, c.Syslog.Server, c.Syslog.Tag, stats)
 		cmd.FailOnError(err, "Could not connect to Syslog")
 
+		// AUDIT[ Error Conditions ] 9cc4d537-8534-4970-8665-4b382abe82f3
+		defer auditlogger.AuditPanic()
+
 		blog.SetAuditLogger(auditlogger)
 
-		cac, dbMap, closeChan := setupClients(c)
+		// Configure DB
+		dbMap, err := sa.NewDbMap(c.OCSP.DBDriver, c.OCSP.DBName)
+		if err != nil {
+			panic(err)
+		}
+		dbMap.AddTableWithName(core.OcspResponse{}, "ocspResponses").SetKeys(true, "ID")
+
+		cac, closeChan := setupClients(c)
 
 		go func() {
 			// sit around and reconnect to AMQP if the channel
@@ -85,15 +96,21 @@ func main() {
 				for err := range closeChan {
 					auditlogger.Warning(fmt.Sprintf("AMQP Channel closed, will reconnect in 5 seconds: [%s]", err))
 					time.Sleep(time.Second * 5)
-					cac, dbMap, closeChan = setupClients(c)
-					wfe.RA = &rac
-					wfe.SA = &sac
+					cac, closeChan = setupClients(c)
 					auditlogger.Warning("Reconnected to AMQP")
 				}
 			}
 		}()
 
-		updateOne()
+		// Calculate the cut-off timestamp
+		dur, err := time.ParseDuration(c.OCSP.MinTimeToExpiry)
+		if err != nil {
+			panic(err)
+		}
+		oldestLastUpdatedTime := time.Now().Add(dur)
+		auditlogger.Info(fmt.Sprintf("Searching for OCSP reponses older than %s", oldestLastUpdatedTime))
+
+		updateOne(dbMap, oldestLastUpdatedTime)
 	}
 
 	app.Run()

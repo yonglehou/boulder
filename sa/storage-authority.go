@@ -8,7 +8,6 @@ package sa
 import (
 	"crypto/sha256"
 	"crypto/x509"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,12 +34,6 @@ func digest256(data []byte) []byte {
 	return d.Sum(nil)
 }
 
-var dialectMap map[string]interface{} = map[string]interface{}{
-	"sqlite3":  gorp.SqliteDialect{},
-	"mysql":    gorp.MySQLDialect{Engine: "InnoDB", Encoding: "UTF8"},
-	"postgres": gorp.PostgresDialect{},
-}
-
 // Utility models
 type pendingauthzModel struct {
 	core.Authorization
@@ -52,25 +45,6 @@ type authzModel struct {
 	core.Authorization
 
 	Sequence int64 `db:"sequence"`
-}
-
-func NewDbMap(driver, dbName string) (dbMap *gorp.DbMap, err error) {
-	db, err := sql.Open(driver, dbName)
-	if err != nil {
-		return
-	}
-	if err = db.Ping(); err != nil {
-		return
-	}
-
-	dialect, ok := dialectMap[driver].(gorp.Dialect)
-	if !ok {
-		err = fmt.Errorf("Couldn't find dialect for %s", driver)
-		return
-	}
-
-	dbMap = &gorp.DbMap{Db: db, Dialect: dialect, TypeConverter: BoulderTypeConverter{}}
-	return
 }
 
 func NewSQLStorageAuthority(driver string, name string) (ssa *SQLStorageAuthority, err error) {

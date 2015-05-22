@@ -93,9 +93,10 @@ type Config struct {
 	}
 
 	OCSP struct {
-		DBDriver string
-		DBName   string
-		Path     string
+		DBDriver        string
+		DBName          string
+		Path            string
+		MinTimeToExpiry string
 	}
 
 	SubscriberAgreementURL string
