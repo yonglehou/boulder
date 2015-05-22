@@ -107,7 +107,7 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		oldestLastUpdatedTime := time.Now().Add(dur)
+		oldestLastUpdatedTime := time.Now().Add(-dur)
 		auditlogger.Info(fmt.Sprintf("Searching for OCSP reponses older than %s", oldestLastUpdatedTime))
 
 		updateOne(dbMap, oldestLastUpdatedTime)
