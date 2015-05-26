@@ -53,6 +53,9 @@ type WebFrontEndImpl struct {
 
 	// Issuer certificate (DER) for /acme/issuer-cert
 	IssuerCert []byte
+
+	// URL to the current subscriber agreement (should contain some version identifier)
+	SubscriberAgreementURL string
 }
 
 // NewWebFrontEndImpl constructs a web service for Boulder
@@ -260,6 +263,10 @@ func (wfe *WebFrontEndImpl) NewRegistration(response http.ResponseWriter, reques
 		wfe.sendError(response, "Error unmarshaling JSON", err, http.StatusBadRequest)
 		return
 	}
+	if len(unmarshalled.Agreement) > 0 && unmarshalled.Agreement != wfe.SubscriberAgreementURL {
+		wfe.sendError(response, fmt.Sprintf("Provided agreement URL [%s] does not match current agreement URL [%s]", unmarshalled.Agreement, wfe.SubscriberAgreementURL), nil, http.StatusBadRequest)
+		return
+	}
 	init.MergeUpdate(unmarshalled)
 
 	reg, err := wfe.RA.NewRegistration(init, *key)
@@ -281,8 +288,8 @@ func (wfe *WebFrontEndImpl) NewRegistration(response http.ResponseWriter, reques
 	response.Header().Add("Location", regURL)
 	response.Header().Set("Content-Type", "application/json")
 	response.Header().Add("Link", link(wfe.NewAuthz, "next"))
-	if len(wfe.TermsPath) > 0 {
-		response.Header().Add("Link", link(wfe.BaseURL+wfe.TermsPath, "terms-of-service"))
+	if len(wfe.SubscriberAgreementURL) > 0 {
+		response.Header().Add("Link", link(wfe.SubscriberAgreementURL, "terms-of-service"))
 	}
 
 	response.WriteHeader(http.StatusCreated)
@@ -305,6 +312,10 @@ func (wfe *WebFrontEndImpl) NewAuthorization(response http.ResponseWriter, reque
 		} else {
 			wfe.sendError(response, "Unable to read/verify body", err, http.StatusBadRequest)
 		}
+		return
+	}
+	if currReg.Agreement == "" {
+		wfe.sendError(response, "Must agree to subscriber agreement before any further actions", nil, http.StatusForbidden)
 		return
 	}
 
@@ -349,6 +360,8 @@ func (wfe *WebFrontEndImpl) RevokeCertificate(response http.ResponseWriter, requ
 		return
 	}
 
+	// We don't ask verifyPOST to verify there is a correponding registration,
+	// because anyone with the right private key can revoke a certificate.
 	body, requestKey, _, err := wfe.verifyPOST(request, false)
 	if err != nil {
 		wfe.sendError(response, "Unable to read/verify body", err, http.StatusBadRequest)
@@ -434,6 +447,10 @@ func (wfe *WebFrontEndImpl) NewCertificate(response http.ResponseWriter, request
 		}
 		return
 	}
+	if reg.Agreement == "" {
+		wfe.sendError(response, "Must agree to subscriber agreement before any further actions", nil, http.StatusForbidden)
+		return
+	}
 
 	var init core.CertificateRequest
 	if err = json.Unmarshal(body, &init); err != nil {
@@ -510,6 +527,10 @@ func (wfe *WebFrontEndImpl) Challenge(authz core.Authorization, response http.Re
 			} else {
 				wfe.sendError(response, "Unable to read/verify body", err, http.StatusBadRequest)
 			}
+			return
+		}
+		if currReg.Agreement == "" {
+			wfe.sendError(response, "Must agree to subscriber agreement before any further actions", nil, http.StatusForbidden)
 			return
 		}
 
@@ -594,6 +615,13 @@ func (wfe *WebFrontEndImpl) Registration(response http.ResponseWriter, request *
 	err = json.Unmarshal(body, &update)
 	if err != nil {
 		wfe.sendError(response, "Error unmarshaling registration", err, http.StatusBadRequest)
+		return
+	}
+
+	if len(update.Agreement) > 0 && update.Agreement != wfe.SubscriberAgreementURL {
+		wfe.sendError(response,
+			fmt.Sprintf("Provided agreement URL [%s] does not match current agreement URL [%s]",
+				update.Agreement, wfe.SubscriberAgreementURL), nil, http.StatusBadRequest)
 		return
 	}
 

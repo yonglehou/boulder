@@ -40,19 +40,24 @@ type Config struct {
 	// IssuerKey must be empty (and TestMode must be false). PEM-encoded private
 	// key used for signing certificates and OCSP responses.
 	IssuerKey string
+	// How long issue certificates are valid for, should match expiry field
+	// in cfssl config.
+	Expiry string
 }
 
 // CertificateAuthorityImpl represents a CA that signs certificates, CRLs, and
 // OCSP responses.
 type CertificateAuthorityImpl struct {
-	profile    string
-	Signer     signer.Signer
-	OCSPSigner ocsp.Signer
-	SA         core.StorageAuthority
-	PA         core.PolicyAuthority
-	DB         core.CertificateAuthorityDatabase
-	log        *blog.AuditLogger
-	Prefix     int // Prepended to the serial number
+	profile        string
+	Signer         signer.Signer
+	OCSPSigner     ocsp.Signer
+	SA             core.StorageAuthority
+	PA             core.PolicyAuthority
+	DB             core.CertificateAuthorityDatabase
+	log            *blog.AuditLogger
+	Prefix         int // Prepended to the serial number
+	ValidityPeriod time.Duration
+	NotAfter       time.Time
 }
 
 // NewCertificateAuthorityImpl creates a CA that talks to a remote CFSSL
@@ -116,7 +121,11 @@ func NewCertificateAuthorityImpl(cadb core.CertificateAuthorityDatabase, config 
 	}
 	// Set up our OCSP signer. Note this calls for both the issuer cert and the
 	// OCSP signing cert, which are the same in our case.
-	ocspSigner, err := ocsp.NewSigner(issuer, issuer, ms, time.Hour*24*4)
+	ocspSigner, err := ocsp.NewSigner(issuer, issuer, ms,
+		time.Hour*24*4)
+	if err != nil {
+		return nil, err
+	}
 
 	pa := policy.NewPolicyAuthorityImpl()
 
@@ -128,8 +137,15 @@ func NewCertificateAuthorityImpl(cadb core.CertificateAuthorityDatabase, config 
 		DB:         cadb,
 		Prefix:     config.SerialPrefix,
 		log:        logger,
+		NotAfter:   issuer.NotAfter,
 	}
-	return ca, err
+
+	ca.ValidityPeriod, err = time.ParseDuration(config.Expiry)
+	if err != nil {
+		return nil, err
+	}
+
+	return ca, nil
 }
 
 func loadIssuer(filename string) (issuerCert *x509.Certificate, err error) {
@@ -219,6 +235,12 @@ func (ca *CertificateAuthorityImpl) IssueCertificate(csr x509.CertificateRequest
 
 	if dupeNames(hostNames) {
 		err = errors.New("Cannot issue a certificate with duplicate DNS names.")
+		ca.log.WarningErr(err)
+		return emptyCert, err
+	}
+
+	if ca.NotAfter.Before(time.Now().Add(ca.ValidityPeriod)) {
+		err = errors.New("Cannot issue a certificate that expires after the intermediate certificate.")
 		ca.log.WarningErr(err)
 		return emptyCert, err
 	}

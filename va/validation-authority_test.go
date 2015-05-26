@@ -51,14 +51,25 @@ var TheKey rsa.PrivateKey = rsa.PrivateKey{
 
 var ident core.AcmeIdentifier = core.AcmeIdentifier{Type: core.IdentifierType("dns"), Value: "localhost"}
 
+const expectedToken = "THETOKEN"
+const pathWrongToken = "wrongtoken"
+const path404 = "404"
+
 func simpleSrv(t *testing.T, token string, stopChan, waitChan chan bool) {
+	// Reset any existing handlers
+	http.DefaultServeMux = http.NewServeMux()
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "404") {
+		if strings.HasSuffix(r.URL.Path, path404) {
+			t.Logf("SIMPLESRV: Got a 404 req\n")
 			http.NotFound(w, r)
-		} else if strings.HasSuffix(r.URL.Path, "wrongtoken") {
+		} else if strings.HasSuffix(r.URL.Path, pathWrongToken) {
+			t.Logf("SIMPLESRV: Got a wrongtoken req\n")
 			fmt.Fprintf(w, "wrongtoken")
+		} else {
+			t.Logf("SIMPLESRV: Got a valid req\n")
+			fmt.Fprintf(w, "%s", token)
 		}
-		fmt.Fprintf(w, "%s", token)
 	})
 
 	httpsServer := &http.Server{Addr: "localhost:5001"}
@@ -77,7 +88,7 @@ func simpleSrv(t *testing.T, token string, stopChan, waitChan chan bool) {
 	t.Fatalf("%s", httpsServer.Serve(conn))
 }
 
-func dvsniSrv(t *testing.T, R, S []byte, waitChan chan bool) {
+func dvsniSrv(t *testing.T, R, S []byte, stopChan, waitChan chan bool) {
 	RS := append(R, S...)
 	z := sha256.Sum256(RS)
 	zName := fmt.Sprintf("%064x.acme.invalid", z)
@@ -119,6 +130,12 @@ func dvsniSrv(t *testing.T, R, S []byte, waitChan chan bool) {
 		t.Fatalf("Couldn't listen on %s: %s", httpsServer.Addr, err)
 	}
 	tlsListener := tls.NewListener(conn, tlsConfig)
+
+	go func() {
+		<-stopChan
+		conn.Close()
+	}()
+
 	waitChan <- true
 	t.Fatalf("%s", httpsServer.Serve(tlsListener))
 }
@@ -126,35 +143,41 @@ func dvsniSrv(t *testing.T, R, S []byte, waitChan chan bool) {
 func TestSimpleHttps(t *testing.T) {
 	va := NewValidationAuthorityImpl(true)
 
-	chall := core.Challenge{Path: "test", Token: "THETOKEN"}
+	chall := core.Challenge{Path: "test", Token: expectedToken}
 
-	invalidChall := va.validateSimpleHTTPS(ident, chall)
+	invalidChall, err := va.validateSimpleHTTPS(ident, chall)
 	test.AssertEquals(t, invalidChall.Status, core.StatusInvalid)
+	test.AssertError(t, err, "Server's not up yet; expected refusal. Where did we connect?")
 
 	stopChan := make(chan bool, 1)
 	waitChan := make(chan bool, 1)
-	go simpleSrv(t, "THETOKEN", stopChan, waitChan)
+	go simpleSrv(t, expectedToken, stopChan, waitChan)
+	defer func() { stopChan <- true }()
+	<-waitChan
 
-	finChall := va.validateSimpleHTTPS(ident, chall)
+	finChall, err := va.validateSimpleHTTPS(ident, chall)
 	test.AssertEquals(t, finChall.Status, core.StatusValid)
+	test.AssertNotError(t, err, chall.Path)
 
-	chall.Path = "404"
-	invalidChall = va.validateSimpleHTTPS(ident, chall)
+	chall.Path = path404
+	invalidChall, err = va.validateSimpleHTTPS(ident, chall)
 	test.AssertEquals(t, invalidChall.Status, core.StatusInvalid)
+	test.AssertError(t, err, "Should have found a 404 for the challenge.")
 
-	chall.Path = "wrongtoken"
-	invalidChall = va.validateSimpleHTTPS(ident, chall)
+	chall.Path = pathWrongToken
+	invalidChall, err = va.validateSimpleHTTPS(ident, chall)
 	test.AssertEquals(t, invalidChall.Status, core.StatusInvalid)
+	test.AssertError(t, err, "The path should have given us the wrong token.")
 
 	chall.Path = ""
-	invalidChall = va.validateSimpleHTTPS(ident, chall)
+	invalidChall, err = va.validateSimpleHTTPS(ident, chall)
 	test.AssertEquals(t, invalidChall.Status, core.StatusInvalid)
+	test.AssertError(t, err, "Empty paths shouldn't work either.")
 
 	chall.Path = "validish"
-	invalidChall = va.validateSimpleHTTPS(core.AcmeIdentifier{Type: core.IdentifierType("ip"), Value: "127.0.0.1"}, chall)
+	invalidChall, err = va.validateSimpleHTTPS(core.AcmeIdentifier{Type: core.IdentifierType("ip"), Value: "127.0.0.1"}, chall)
 	test.AssertEquals(t, invalidChall.Status, core.StatusInvalid)
-
-	stopChan <- true
+	test.AssertError(t, err, "IdentifierType IP shouldn't have worked.")
 }
 
 func TestDvsni(t *testing.T) {
@@ -164,40 +187,163 @@ func TestDvsni(t *testing.T) {
 	ba := core.B64enc(a)
 	chall := core.Challenge{R: ba, S: ba}
 
-	invalidChall := va.validateDvsni(ident, chall)
+	invalidChall, err := va.validateDvsni(ident, chall)
 	test.AssertEquals(t, invalidChall.Status, core.StatusInvalid)
+	test.AssertError(t, err, "Server's not up yet; expected refusal. Where did we connect?")
 
 	waitChan := make(chan bool, 1)
-	go dvsniSrv(t, a, a, waitChan)
+	stopChan := make(chan bool, 1)
+	go dvsniSrv(t, a, a, stopChan, waitChan)
+	defer func() { stopChan <- true }()
 	<-waitChan
 
-	finChall := va.validateDvsni(ident, chall)
+	finChall, err := va.validateDvsni(ident, chall)
 	test.AssertEquals(t, finChall.Status, core.StatusValid)
+	test.AssertNotError(t, err, "")
 
 	chall.R = ba[5:]
-	invalidChall = va.validateDvsni(ident, chall)
+	invalidChall, err = va.validateDvsni(ident, chall)
 	test.AssertEquals(t, invalidChall.Status, core.StatusInvalid)
+	test.AssertError(t, err, "R Should be illegal Base64")
 
-	invalidChall = va.validateSimpleHTTPS(core.AcmeIdentifier{Type: core.IdentifierType("ip"), Value: "127.0.0.1"}, chall)
+	invalidChall, err = va.validateSimpleHTTPS(core.AcmeIdentifier{Type: core.IdentifierType("ip"), Value: "127.0.0.1"}, chall)
 	test.AssertEquals(t, invalidChall.Status, core.StatusInvalid)
+	test.AssertError(t, err, "Forgot path; that should be an error.")
 
 	chall.R = ba
 	chall.S = "!@#"
-	invalidChall = va.validateDvsni(ident, chall)
+	invalidChall, err = va.validateDvsni(ident, chall)
 	test.AssertEquals(t, invalidChall.Status, core.StatusInvalid)
+	test.AssertError(t, err, "S Should be illegal Base64")
 }
 
-type MockRegistrationAuthority struct{}
+func TestValidateHTTPS(t *testing.T) {
+	va := NewValidationAuthorityImpl(true)
+	mockRA := &MockRegistrationAuthority{}
+	va.RA = mockRA
+
+	challHTTPS := core.SimpleHTTPSChallenge()
+	challHTTPS.Path = "test"
+
+	stopChanHTTPS := make(chan bool, 1)
+	waitChanHTTPS := make(chan bool, 1)
+	go simpleSrv(t, challHTTPS.Token, stopChanHTTPS, waitChanHTTPS)
+
+	// Let them start
+	<-waitChanHTTPS
+
+	// shutdown cleanly
+	defer func() {
+		stopChanHTTPS <- true
+	}()
+
+	var authz = core.Authorization{
+		ID:             core.NewToken(),
+		RegistrationID: 1,
+		Identifier:     ident,
+		Challenges:     []core.Challenge{challHTTPS},
+	}
+	va.validate(authz, 0)
+
+	test.AssertEquals(t, core.StatusValid, mockRA.lastAuthz.Challenges[0].Status)
+}
+
+func TestValidateDvsni(t *testing.T) {
+	va := NewValidationAuthorityImpl(true)
+	mockRA := &MockRegistrationAuthority{}
+	va.RA = mockRA
+
+	challDvsni := core.DvsniChallenge()
+	challDvsni.S = challDvsni.R
+
+	waitChanDvsni := make(chan bool, 1)
+	stopChanDvsni := make(chan bool, 1)
+	ar, _ := core.B64dec(challDvsni.R)
+	as, _ := core.B64dec(challDvsni.S)
+	go dvsniSrv(t, ar, as, stopChanDvsni, waitChanDvsni)
+
+	// Let them start
+	<-waitChanDvsni
+
+	// shutdown cleanly
+	defer func() {
+		stopChanDvsni <- true
+	}()
+
+	var authz = core.Authorization{
+		ID:             core.NewToken(),
+		RegistrationID: 1,
+		Identifier:     ident,
+		Challenges:     []core.Challenge{challDvsni},
+	}
+	va.validate(authz, 0)
+
+	test.AssertEquals(t, core.StatusValid, mockRA.lastAuthz.Challenges[0].Status)
+}
+
+func TestValidateDvsniNotSane(t *testing.T) {
+	va := NewValidationAuthorityImpl(true)
+	mockRA := &MockRegistrationAuthority{}
+	va.RA = mockRA
+
+	challDvsni := core.DvsniChallenge()
+	challDvsni.R = "boulder" // Not a sane thing to do.
+
+	waitChanDvsni := make(chan bool, 1)
+	stopChanDvsni := make(chan bool, 1)
+	ar, _ := core.B64dec(challDvsni.R)
+	as, _ := core.B64dec(challDvsni.S)
+	go dvsniSrv(t, ar, as, stopChanDvsni, waitChanDvsni)
+
+	// Let them start
+	<-waitChanDvsni
+
+	// shutdown cleanly
+	defer func() {
+		stopChanDvsni <- true
+	}()
+
+	var authz = core.Authorization{
+		ID:             core.NewToken(),
+		RegistrationID: 1,
+		Identifier:     ident,
+		Challenges:     []core.Challenge{challDvsni},
+	}
+	va.validate(authz, 0)
+
+	test.AssertEquals(t, core.StatusInvalid, mockRA.lastAuthz.Challenges[0].Status)
+}
+
+func TestUpdateValidations(t *testing.T) {
+	va := NewValidationAuthorityImpl(true)
+	mockRA := &MockRegistrationAuthority{}
+	va.RA = mockRA
+
+	var authz = core.Authorization{
+		ID:             core.NewToken(),
+		RegistrationID: 1,
+		Identifier:     ident,
+		Challenges:     []core.Challenge{core.DvsniChallenge()},
+	}
+
+	va.UpdateValidations(authz, 0)
+
+	// Nothing to assert.
+}
+
+type MockRegistrationAuthority struct {
+	lastAuthz *core.Authorization
+}
 
 func (ra *MockRegistrationAuthority) NewRegistration(reg core.Registration, jwk jose.JsonWebKey) (core.Registration, error) {
 	return reg, nil
 }
 
-func (ra *MockRegistrationAuthority) NewAuthorization(authz core.Authorization, jwk jose.JsonWebKey) (core.Authorization, error) {
+func (ra *MockRegistrationAuthority) NewAuthorization(authz core.Authorization, regID int64) (core.Authorization, error) {
 	return authz, nil
 }
 
-func (ra *MockRegistrationAuthority) NewCertificate(req core.CertificateRequest, jwk jose.JsonWebKey) (core.Certificate, error) {
+func (ra *MockRegistrationAuthority) NewCertificate(req core.CertificateRequest, regID int64) (core.Certificate, error) {
 	return core.Certificate{}, nil
 }
 
@@ -213,5 +359,7 @@ func (ra *MockRegistrationAuthority) RevokeCertificate(cert x509.Certificate) er
 	return nil
 }
 
-func (ra *MockRegistrationAuthority) OnValidationUpdate(authz core.Authorization) {
+func (ra *MockRegistrationAuthority) OnValidationUpdate(authz core.Authorization) error {
+	ra.lastAuthz = &authz
+	return nil
 }

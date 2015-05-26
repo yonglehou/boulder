@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cloudflare/cfssl/signer/local"
 	_ "github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/mattn/go-sqlite3"
@@ -31,7 +32,7 @@ type DummyValidationAuthority struct {
 	Argument core.Authorization
 }
 
-func (dva *DummyValidationAuthority) UpdateValidations(authz core.Authorization) (err error) {
+func (dva *DummyValidationAuthority) UpdateValidations(authz core.Authorization, index int) (err error) {
 	dva.Called = true
 	dva.Argument = authz
 	return
@@ -127,7 +128,7 @@ func initAuthorities(t *testing.T) (core.CertificateAuthority, *DummyValidationA
 	signer, _ := local.NewSigner(caKey, caCert, x509.SHA256WithRSA, nil)
 	pa := policy.NewPolicyAuthorityImpl()
 	cadb := &MockCADatabase{}
-	ca := ca.CertificateAuthorityImpl{Signer: signer, SA: sa, PA: pa, DB: cadb}
+	ca := ca.CertificateAuthorityImpl{Signer: signer, SA: sa, PA: pa, DB: cadb, ValidityPeriod: time.Hour * 8760, NotAfter: time.Now().Add(time.Hour * 8761)}
 	csrDER, _ := hex.DecodeString(CSR_HEX)
 	ExampleCSR, _ = x509.ParseCertificateRequest(csrDER)
 
